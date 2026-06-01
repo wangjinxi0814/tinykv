@@ -173,3 +173,16 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
 	}
 	return l.storage.Term(i)
 }
+
+// StableTo
+func (l *RaftLog) StableTo(index uint64, term uint64) {
+	// if len(l.entries) > 0 && i >= l.entries[0].Index {
+	// 	offset := l.entries[0].Index
+	// 	idx := i - offset
+	// 	if idx < uint64(len(l.entries)) {
+	// 	}
+	// }
+	for i:= l.stabled; i < uint64(len(l.entries)); i++{
+		
+	}
+}

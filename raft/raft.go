@@ -18,7 +18,6 @@ import (
 	"errors"
 	"math/rand"
 	"sort"
-	"sync"
 	"time"
 
 	pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
@@ -58,18 +57,6 @@ func (st StateType) String() string {
 // ErrProposalDropped is returned when the proposal is ignored by some cases,
 // so that the proposer can be notified and fail fast.
 var ErrProposalDropped = errors.New("raft proposal dropped")
-
-// 全局随机源：用于选举超时随机化，避免所有节点同时发起选举
-var (
-	globalRandMu sync.Mutex
-	globalRand   = rand.New(rand.NewSource(time.Now().UnixNano()))
-)
-
-func randIntn(n int) int {
-	globalRandMu.Lock()
-	defer globalRandMu.Unlock()
-	return globalRand.Intn(n)
-}
 
 // Config contains the parameters to start a raft.
 type Config struct {
@@ -183,6 +170,9 @@ type Raft struct {
 	// (Used in 3A conf change)
 	PendingConfIndex uint64
 
+	// 随机数种子, 用于随机选举超时时间
+	rand *rand.Rand
+
 	// 动态可替换的 tick 闭包：Follower/Candidate 用 tickElection，Leader 用 tickHeartbeat
 	tick func()
 }
@@ -214,10 +204,19 @@ func newRaft(c *Config) *Raft {
 		votes:            make(map[uint64]bool),
 		electionTimeout:  c.ElectionTick,
 		heartbeatTimeout: c.HeartbeatTick,
+		rand:             rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 
 	for _, p := range peers {
 		r.Prs[p] = &Progress{}
+	}
+
+	// 从持久化的 HardState 恢复 committed；重启时还要恢复 applied
+	if !IsEmptyHardState(hardState) {
+		raftLog.committed = hardState.Commit
+	}
+	if c.Applied > 0 {
+		raftLog.applied = c.Applied
 	}
 
 	// 启动时默认 Follower 状态（任期沿用 HardState，无 Leader）
@@ -225,10 +224,17 @@ func newRaft(c *Config) *Raft {
 	return r
 }
 
-// Tick 逻辑计时器
-func (r *Raft) Tick() {
-	if r.tick != nil {
-		r.tick()
+// softState 返回当前易失状态（leader + 角色）
+func (r *Raft) softState() *SoftState {
+	return &SoftState{Lead: r.Lead, RaftState: r.State}
+}
+
+// hardState 返回需要持久化的状态（term/vote/commit）
+func (r *Raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.RaftLog.committed,
 	}
 }
 
@@ -260,76 +266,8 @@ func (r *Raft) tickHeartbeat() {
 
 // [electionTimeout, 2 * electionTimeout)
 func (r *Raft) resetRandomizedElectionTimeout() {
-	r.randomizedElectionTimeout = r.electionTimeout + randIntn(r.electionTimeout)
-}
-
-// becomeFollower 把当前节点转为 Follower
-func (r *Raft) becomeFollower(term uint64, lead uint64) {
-	r.State = StateFollower
-	// 仅在任期真正改变时才清空本任期的投票，避免覆盖已持久化 / 本任期已投出的票
-	if term != r.Term {
-		r.Term = term
-		r.Vote = None
-	}
-	r.Lead = lead
-	r.electionElapsed = 0
-	r.heartbeatElapsed = 0
-	r.resetRandomizedElectionTimeout()
-	r.tick = r.tickElection
-}
-
-// becomeCandidate 把当前节点转为 Candidate（任期 +1，重置票箱）
-func (r *Raft) becomeCandidate() {
-	r.State = StateCandidate
-	r.Term++
-	r.Vote = r.id
-	r.Lead = None
-	r.electionElapsed = 0
-	r.heartbeatElapsed = 0
-	r.resetRandomizedElectionTimeout()
-
-	// 票箱重置；自投票由 campaign 通过 poll 统一记入
-	r.votes = make(map[uint64]bool)
-
-	r.tick = r.tickElection
-}
-
-// becomeLeader 把当前节点转为 Leader，并初始化所有 Follower 的复制进度
-func (r *Raft) becomeLeader() {
-	// NOTE: Leader 上任后应当 propose 一条本任期的 noop entry（2AB 实现）
-	r.State = StateLeader
-	r.Lead = r.id
-	r.electionElapsed = 0
-	r.heartbeatElapsed = 0
-	r.leadTransferee = None
-	r.tick = r.tickHeartbeat
-
-	lastIndex := r.RaftLog.LastIndex()
-	for peer := range r.Prs {
-		r.Prs[peer] = &Progress{
-			Match: 0,
-			Next:  lastIndex + 1,
-		}
-	}
-	// 追加并广播本任期的 noop entry；appendEntries 内部会把 leader 自身的进度
-	// 推进到末尾，followers 的 Next 此前已置为 lastIndex+1 即 noop 的位置
-	r.appendEntries([]*pb.Entry{{}})
-	r.bcastAppend()
-	// 单节点集群：noop 立即满足多数派，直接提交
-	r.maybeCommit()
-}
-
-// appendEntries 把客户端提议的 entries 追加到 leader 自己的日志，
-// 填好 term/index 并推进 leader 自身的 Progress
-func (r *Raft) appendEntries(es []*pb.Entry) {
-	li := r.RaftLog.LastIndex()
-	for i, e := range es {
-		e.Term = r.Term
-		e.Index = li + 1 + uint64(i)
-		r.RaftLog.entries = append(r.RaftLog.entries, *e)
-	}
-	r.Prs[r.id].Match = r.RaftLog.LastIndex()
-	r.Prs[r.id].Next = r.RaftLog.LastIndex() + 1
+	r.randomizedElectionTimeout =
+		r.electionTimeout + r.rand.Intn(r.electionTimeout)
 }
 
 // bcastAppend 向所有 Follower 发送 MsgAppend
@@ -342,8 +280,18 @@ func (r *Raft) bcastAppend() {
 	}
 }
 
+// bcastHeartbeat 向所有 Follower 发送 MsgHeartbeat
+func (r *Raft) bcastHeartbeat() {
+	for peer := range r.Prs {
+		if peer == r.id {
+			continue
+		}
+		r.sendHeartbeat(peer)
+	}
+}
+
 // maybeCommit 尝试把 committed 推进到多数派已复制的最大 index。
-// 推进成功返回 true。遵循论文 5.4.2：只提交当前任期的日志。
+// 推进成功返回 true。
 func (r *Raft) maybeCommit() bool {
 	matches := make(uint64Slice, 0, len(r.Prs))
 	for _, pr := range r.Prs {
@@ -355,69 +303,12 @@ func (r *Raft) maybeCommit() bool {
 	if mci <= r.RaftLog.committed {
 		return false
 	}
+	// 遵循论文 5.4.2：只能提交当前 Term 的日志
 	if term, err := r.RaftLog.Term(mci); err != nil || term != r.Term {
 		return false
 	}
 	r.RaftLog.committed = mci
 	return true
-}
-
-// campaign 发起一次选举：转为 Candidate 并向其他 peer 拉票
-func (r *Raft) campaign() {
-	r.becomeCandidate()
-
-	// 自投一票，统一走 poll 计票；单节点集群此时已构成多数派，直接登基
-	if r.poll(r.id, true) == VoteWon {
-		r.becomeLeader()
-		return
-	}
-
-	// 携带本地日志末尾的 (term, index)，供对方做 5.4.1 的 up-to-date 检查
-	lastIndex, lastTerm := r.lastLogIndexTerm()
-	for peer := range r.Prs {
-		if peer == r.id {
-			continue
-		}
-		r.send(pb.Message{
-			MsgType: pb.MessageType_MsgRequestVote,
-			To:      peer,
-			LogTerm: lastTerm,
-			Index:   lastIndex,
-		})
-	}
-}
-
-// poll 记录一票并返回当前选举结果
-func (r *Raft) poll(id uint64, granted bool) VoteResult {
-	if _, ok := r.votes[id]; !ok {
-		r.votes[id] = granted
-	}
-	grants, rejects := 0, 0
-	for _, v := range r.votes {
-		if v {
-			grants++
-		} else {
-			rejects++
-		}
-	}
-	quorum := len(r.Prs)/2 + 1
-	switch {
-	case grants >= quorum:
-		return VoteWon
-	case rejects >= quorum:
-		return VoteLost
-	default:
-		return VotePending
-	}
-}
-
-// send 统一出口：自动填充 From / Term，避免分散在各处手填
-func (r *Raft) send(m pb.Message) {
-	m.From = r.id
-	if m.Term == 0 {
-		m.Term = r.Term
-	}
-	r.msgs = append(r.msgs, m)
 }
 
 // lastLogIndexTerm 取本地日志末尾的 (index, term)
@@ -434,59 +325,4 @@ func (r *Raft) isLogUpToDate(lastTerm, lastIndex uint64) bool {
 		return lastTerm > myTerm
 	}
 	return lastIndex >= myIndex
-}
-
-// sendAppend sends an append RPC with new entries (if any) and the
-// current commit index to the given peer. Returns true if a message was sent.
-func (r *Raft) sendAppend(to uint64) bool {
-	// Your Code Here (2AB).
-	pr := r.Prs[to]
-	if pr == nil {
-		return false
-	}
-	prevIndex := pr.Next - 1
-	prevTerm, err := r.RaftLog.Term(prevIndex)
-	if err != nil {
-		// prevIndex 已被快照压缩，无法构造 MsgAppend，需改发快照（2C 处理）
-		return false
-	}
-	ents := r.RaftLog.entriesFrom(pr.Next)
-	sendEnts := make([]*pb.Entry, 0, len(ents))
-	for i := range ents {
-		sendEnts = append(sendEnts, &ents[i])
-	}
-	r.send(pb.Message{
-		MsgType: pb.MessageType_MsgAppend,
-		To:      to,
-		Index:   prevIndex,
-		LogTerm: prevTerm,
-		Entries: sendEnts,
-		Commit:  r.RaftLog.committed,
-	})
-	return true
-}
-
-// sendHeartbeat sends a heartbeat RPC to the given peer.
-func (r *Raft) sendHeartbeat(to uint64) {
-	// 心跳携带的 commit 不能超过该 Follower 已匹配的进度，否则会让落后的
-	// Follower 误提交它尚未拥有的日志
-	commit := r.RaftLog.committed
-	if pr := r.Prs[to]; pr != nil && pr.Match < commit {
-		commit = pr.Match
-	}
-	r.send(pb.Message{
-		MsgType: pb.MessageType_MsgHeartbeat,
-		To:      to,
-		Commit:  commit,
-	})
-}
-
-// addNode add a new node to raft group
-func (r *Raft) addNode(id uint64) {
-	// Your Code Here (3A).
-}
-
-// removeNode remove a node from raft group
-func (r *Raft) removeNode(id uint64) {
-	// Your Code Here (3A).
 }

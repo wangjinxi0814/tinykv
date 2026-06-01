@@ -5,18 +5,16 @@ import (
 )
 
 // handleRequestVote 处理 Candidate 拉票请求，回复 MsgRequestVoteResponse
+// 前置条件：m.Term == r.Term（更低任期已在 Step 入口被 reject，更高任期已被拉平）
 func (r *Raft) handleRequestVote(m pb.Message) {
 	reject := true
 
-	// Term 落后则直接拒绝（Step 入口已处理 m.Term > r.Term 的情况，到这里 m.Term <= r.Term）
-	if m.Term == r.Term {
-		// 本任期还没投过票，或者已经投给了同一个候选人
-		canVote := r.Vote == None || r.Vote == m.From
-		if canVote && r.isLogUpToDate(m.LogTerm, m.Index) {
-			reject = false
-			r.Vote = m.From
-			r.electionElapsed = 0
-		}
+	// 本任期还没投过票，或者已经投给了同一个候选人
+	canVote := r.Vote == None || r.Vote == m.From
+	if canVote && r.isLogUpToDate(m.LogTerm, m.Index) {
+		reject = false
+		r.Vote = m.From
+		r.electionElapsed = 0
 	}
 
 	r.send(pb.Message{
@@ -43,17 +41,9 @@ func (r *Raft) handleRequestVoteResponse(m pb.Message) {
 }
 
 // handleAppendEntries 处理来自 Leader 的 AppendEntries RPC
+// 前置条件：m.Term >= r.Term（更低任期已在 Step 入口被 reject 掉）
 func (r *Raft) handleAppendEntries(m pb.Message) {
-	// 1. 如果 leader 的任期小于自己的任期返回 false。(5.1)
-	if m.Term < r.Term {
-		r.send(pb.Message{
-			MsgType: pb.MessageType_MsgAppendResponse,
-			To:      m.From,
-			Reject:  true,
-		})
-		return
-	}
-	// 心跳报文：转换为 Follower，更新 term 和 leaderId，重置选举计时器
+	// 来自合法 Leader：转换为 Follower，更新 term 和 leaderId，重置选举计时器
 	r.becomeFollower(m.Term, m.From)
 
 	lastNew := m.Index + uint64(len(m.Entries))
@@ -150,22 +140,15 @@ func (r *Raft) handleHeartbeatResponse(m pb.Message) {
 	if m.Reject {
 		return
 	}
+	//
 	if pr := r.Prs[m.From]; pr != nil && pr.Match < r.RaftLog.LastIndex() {
 		r.sendAppend(m.From)
 	}
 }
 
 // handleHeartbeat 处理来自 Leader 的 Heartbeat RPC
+// 前置条件：m.Term >= r.Term（更低任期已在 Step 入口被 reject 掉）
 func (r *Raft) handleHeartbeat(m pb.Message) {
-	// Term 较低拒绝心跳
-	if m.Term < r.Term {
-		r.send(pb.Message{
-			MsgType: pb.MessageType_MsgHeartbeatResponse,
-			To:      m.From,
-			Reject:  true,
-		})
-		return
-	}
 	// 收到合法 Leader 的心跳：刷新计时器
 	r.electionElapsed = 0
 	r.Lead = m.From
@@ -182,4 +165,109 @@ func (r *Raft) handleHeartbeat(m pb.Message) {
 // handleSnapshot 处理来自 Leader 的 Snapshot RPC
 func (r *Raft) handleSnapshot(m pb.Message) {
 	// Your Code Here (2C).
+}
+
+// becomeFollower 把当前节点转为 Follower
+func (r *Raft) becomeFollower(term uint64, lead uint64) {
+	r.State = StateFollower
+	// 仅在任期真正改变时才清空本任期的投票，避免覆盖已持久化 / 本任期已投出的票
+	if term != r.Term {
+		r.Term = term
+		r.Vote = None
+	}
+	r.Lead = lead
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetRandomizedElectionTimeout()
+	r.tick = r.tickElection
+}
+
+// becomeCandidate 把当前节点转为 Candidate（任期 +1，重置票箱）
+func (r *Raft) becomeCandidate() {
+	r.State = StateCandidate
+	r.Term++
+	r.Vote = r.id
+	r.Lead = None
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetRandomizedElectionTimeout()
+
+	// 票箱重置；自投票由 campaign 通过 poll 统一记入
+	r.votes = make(map[uint64]bool)
+
+	r.tick = r.tickElection
+}
+
+// becomeLeader 把当前节点转为 Leader，并初始化所有 Follower 的复制进度
+func (r *Raft) becomeLeader() {
+	// NOTE: Leader 上任后应当 propose 一条本任期的 noop entry（2AB 实现）
+	r.State = StateLeader
+	r.Lead = r.id
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.leadTransferee = None
+	r.tick = r.tickHeartbeat
+
+	lastIndex := r.RaftLog.LastIndex()
+	for peer := range r.Prs {
+		r.Prs[peer] = &Progress{
+			Match: 0,
+			Next:  lastIndex + 1,
+		}
+	}
+	// 追加并广播本任期的 noop entry；appendEntries 内部会把 leader 自身的进度
+	// 推进到末尾，followers 的 Next 此前已置为 lastIndex+1 即 noop 的位置
+	r.appendEntries([]*pb.Entry{{}})
+	r.bcastAppend()
+	// 单节点集群：noop 立即满足多数派，直接提交
+	r.maybeCommit()
+}
+
+// campaign 发起一次选举：转为 Candidate 并向其他 peer 拉票
+func (r *Raft) campaign() {
+	r.becomeCandidate()
+
+	// 自投一票，统一走 poll 计票；单节点集群此时已构成多数派，转换为leader
+	if r.poll(r.id, true) == VoteWon {
+		r.becomeLeader()
+		return
+	}
+
+	// 携带本地日志末尾的 (term, index)，供对方做 5.4.1 的 up-to-date 检查
+	lastIndex, lastTerm := r.lastLogIndexTerm()
+	for peer := range r.Prs {
+		if peer == r.id {
+			continue
+		}
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgRequestVote,
+			To:      peer,
+			LogTerm: lastTerm,
+			Index:   lastIndex,
+		})
+	}
+}
+
+// poll 记录一票并返回当前选举结果
+func (r *Raft) poll(id uint64, granted bool) VoteResult {
+	if _, ok := r.votes[id]; !ok {
+		r.votes[id] = granted
+	}
+	grants, rejects := 0, 0
+	for _, v := range r.votes {
+		if v {
+			grants++
+		} else {
+			rejects++
+		}
+	}
+	quorum := len(r.Prs)/2 + 1
+	switch {
+	case grants >= quorum:
+		return VoteWon
+	case rejects >= quorum:
+		return VoteLost
+	default:
+		return VotePending
+	}
 }
