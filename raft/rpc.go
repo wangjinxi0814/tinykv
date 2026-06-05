@@ -15,6 +15,9 @@ func (r *Raft) send(m pb.Message) {
 // 填好 term/index 并推进 leader 自身的 Progress
 func (r *Raft) appendEntries(es []*pb.Entry) {
 	li := r.RaftLog.LastIndex()
+	// 追加并广播本任期的 noop entry；appendEntries 内部会把 leader 自身的进度
+	// 推进到末尾，followers 的 Next 此前已置为 lastIndex+1 即 noop 的位置
+	// noop 会被补上term/index
 	for i, e := range es {
 		e.Term = r.Term
 		e.Index = li + 1 + uint64(i)

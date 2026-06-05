@@ -47,11 +47,18 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
 	r.becomeFollower(m.Term, m.From)
 
 	lastNew := m.Index + uint64(len(m.Entries))
-	// prevLogIndex 在快照范围内，直接接受（快照已覆盖）
-	if snapIndex := m.Snapshot.GetMetadata().GetIndex(); m.Index < snapIndex {
-		if m.Commit > r.RaftLog.committed {
-			r.RaftLog.committed = min(m.Commit, lastNew)
-		}
+
+	// prevLogIndex 落在已提交区（含已被本地快照压缩的部分）：这是一条旧的 / 重叠的
+	// AppendEntries（网络重发、乱序、或 leader Next 退得过低）。已提交日志在全集群
+	// 一致，绝不能用它去截断本地日志；直接回 ACK 告诉 leader 我至少已对齐到 committed，
+	// 让它把 Next 快进过来重发后续。（快照走独立的 MsgSnapshot，不在本消息体内。）
+	if m.Index < r.RaftLog.committed {
+		r.send(pb.Message{
+			MsgType: pb.MessageType_MsgAppendResponse,
+			To:      m.From,
+			Index:   r.RaftLog.committed,
+			Reject:  false,
+		})
 		return
 	}
 
@@ -215,9 +222,9 @@ func (r *Raft) becomeLeader() {
 			Next:  lastIndex + 1,
 		}
 	}
-	// 追加并广播本任期的 noop entry；appendEntries 内部会把 leader 自身的进度
-	// 推进到末尾，followers 的 Next 此前已置为 lastIndex+1 即 noop 的位置
-	r.appendEntries([]*pb.Entry{{}})
+
+	// !leader 只能直接提交"当前任期"的日志, 这里追加了一个noop的日志
+	r.appendEntries([]*pb.Entry{{}}) // 切片长度为1, 里面是一条零值Entry
 	r.bcastAppend()
 	// 单节点集群：noop 立即满足多数派，直接提交
 	r.maybeCommit()

@@ -2,6 +2,11 @@ package raft
 
 import pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
 
+// 1. 持久化  persist HardState/Entries/Snapshot
+// 2. 发消息  send Messages
+// 3. Apply  apply Snapshot → CommittedEntries(ConfChange 回调)
+// 4. Advance  告诉 raft 这批干完了,它才推 unstable/applied 指针、发下一个 Ready
+
 // Ready encapsulates the entries and messages that are ready to read,
 // be saved to stable storage, committed or sent to other peers.
 // All fields in Ready are read-only.
@@ -18,6 +23,7 @@ type Ready struct {
 
 	// Entries specifies entries to be saved to stable storage BEFORE
 	// Messages are sent.
+	// 注意这里实际上是要持久化的entries
 	Entries []pb.Entry
 
 	// Snapshot specifies the snapshot to be saved to stable storage.

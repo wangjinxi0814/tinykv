@@ -28,6 +28,7 @@ var ErrStepLocalMsg = errors.New("raft: cannot step raft local message")
 var ErrStepPeerNotFound = errors.New("raft: cannot step as peer not found")
 
 // SoftState provides state that is volatile and does not need to be persisted to the WAL.
+// 只是用于告知应用层Lead 或者 自身的状态变了
 type SoftState struct {
 	Lead      uint64
 	RaftState StateType
@@ -199,12 +200,12 @@ func (rn *RawNode) HasReady() bool {
 	if len(r.RaftLog.unstableEntries()) > 0 {
 		return true
 	}
-	// 有已提交未应用的日志
-	if len(r.RaftLog.nextEnts()) > 0 {
-		return true
-	}
 	// 有待发送的消息
 	if len(r.msgs) > 0 {
+		return true
+	}
+	// 有已提交未应用的日志
+	if len(r.RaftLog.nextEnts()) > 0 {
 		return true
 	}
 	return false

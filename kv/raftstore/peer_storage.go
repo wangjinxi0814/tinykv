@@ -307,7 +307,31 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 // Append the given entries to the raft log and update ps.raftState also delete log entries that will
 // never be committed
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
-	// Your Code Here (2B).
+	// entries[]
+	if len(entries) == 0{
+		return nil
+	}
+
+	// raftWB.SetMeta()
+
+
+	// Append the given entries to the raft log
+	ps.Engines.WriteRaft(raftWB)
+	// writebatch.SetMeta()
+
+
+
+
+
+	// 更新ps.raftState
+	ps.raftState = &rspb.RaftLocalState{
+		HardState: &eraftpb.HardState{
+			Term: entries[len(entries) - 1].Term,
+			// Vote: ,
+		},
+	}
+
+
 	return nil
 }
 
@@ -330,7 +354,9 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 // Do not modify ready in this function, this is a requirement to advance the ready object properly later.
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	// Your Code Here (2B/2C).
+	if ready != nil{
+		
+	}
 	return nil, nil
 }
 

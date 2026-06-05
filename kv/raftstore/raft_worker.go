@@ -59,6 +59,7 @@ func (rw *raftWorker) run(closeCh <-chan struct{}, wg *sync.WaitGroup) {
 	}
 }
 
+// getPeerState 根据regionID 获取其 peerState, 如果没有则router 分配 peer
 func (rw *raftWorker) getPeerState(peersMap map[uint64]*peerState, regionID uint64) *peerState {
 	peer, ok := peersMap[regionID]
 	if !ok {
