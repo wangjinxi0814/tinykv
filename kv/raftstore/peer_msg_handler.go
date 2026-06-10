@@ -42,7 +42,41 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	if d.stopped {
 		return
 	}
-	// Your Code Here (2B).
+
+	if !d.RaftGroup.HasReady() {
+		return
+	}
+
+	rd := d.RaftGroup.Ready()
+
+	// 持久化日志条目
+	d.peerStorage.SaveReadyState(&rd)
+
+	// 通过网络向其他的peer 发送raft消息
+	for _, msg := range rd.Messages {
+		if err := d.sendRaftMessage(msg, d.ctx.trans); err != nil {
+			log.Errorf("%s send raft message error %v", d.Tag, err)
+		}
+	}
+
+	// 应用已提交的日志条目
+	for _, committed_log := range rd.CommittedEntries {
+		// committed_log.Data // 解码当前的日志 获得cmd
+		// 执行对应的操作, 写db -> 执行
+		
+		// 处理Proposals 等待相应的客户端回调
+		for	_, proposal := range d.proposals{
+			if proposal.term == committed_log.Term{
+				if proposal.index == committed_log.Index{
+					// proposal.cb.Done()
+				}
+				NotifyStaleReq(proposal.term, proposal.cb);
+			}
+		}
+	}
+
+	// 推进 RawNode 状态
+	d.RaftGroup.Advance(rd)
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -223,9 +257,9 @@ func (d *peerMsgHandler) validateRaftMessage(msg *rspb.RaftMessage) bool {
 	return true
 }
 
-/// Checks if the message is sent to the correct peer.
-///
-/// Returns true means that the message can be dropped silently.
+// / Checks if the message is sent to the correct peer.
+// /
+// / Returns true means that the message can be dropped silently.
 func (d *peerMsgHandler) checkMessage(msg *rspb.RaftMessage) bool {
 	fromEpoch := msg.GetRegionEpoch()
 	isVoteMsg := util.IsVoteMessage(msg.Message)

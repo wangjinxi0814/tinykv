@@ -304,32 +304,27 @@ func ClearMeta(engines *engine_util.Engines, kvWB, raftWB *engine_util.WriteBatc
 	return nil
 }
 
-// Append the given entries to the raft log and update ps.raftState also delete log entries that will
-// never be committed
+// Append 将给定的条目添加到 raft 日志中并更新ps.raftState。还会删除不会被 commit 的 log entries
 func (ps *PeerStorage) Append(entries []eraftpb.Entry, raftWB *engine_util.WriteBatch) error {
 	// entries[]
-	if len(entries) == 0{
+	if len(entries) == 0 {
 		return nil
 	}
 
-	// raftWB.SetMeta()
-
-
-	// Append the given entries to the raft log
-	ps.Engines.WriteRaft(raftWB)
-	// writebatch.SetMeta()
-
-
-
-
-
-	// 更新ps.raftState
-	ps.raftState = &rspb.RaftLocalState{
-		HardState: &eraftpb.HardState{
-			Term: entries[len(entries) - 1].Term,
-			// Vote: ,
-		},
+	// 逐条写入metadata
+	for _, entry := range entries {
+		raftWB.SetMeta(meta.RaftLogKey(ps.region.Id, entry.Index), &entry)
 	}
+
+	// 删除陈旧的日志
+	
+	for last := entries[len(entries)-1].Index + 1; last <= ps.raftState.LastIndex; last++ {
+		raftWB.DeleteMeta(meta.RaftLogKey(ps.region.Id, last))
+	}
+
+	// 更新内存 raftState 
+	ps.raftState.LastIndex = entries[len(entries) - 1].Index
+	ps.raftState.LastTerm = entries[len(entries) - 1].Term
 
 
 	return nil
@@ -350,13 +345,28 @@ func (ps *PeerStorage) ApplySnapshot(snapshot *eraftpb.Snapshot, kvWB *engine_ut
 	return nil, nil
 }
 
-// Save memory states to disk.
-// Do not modify ready in this function, this is a requirement to advance the ready object properly later.
+// SaveReadyState  将内存状态保存到磁盘。
+// 不要在此函数中修改ready，这是以后正确推进ready对象的要求。
 func (ps *PeerStorage) SaveReadyState(ready *raft.Ready) (*ApplySnapResult, error) {
 	// Hint: you may call `Append()` and `ApplySnapshot()` in this function
-	if ready != nil{
-		
+	if ready == nil {
+		return nil, nil
 	}
+
+	raftWB := &engine_util.WriteBatch{}
+	ps.Append(ready.Entries, raftWB)
+
+	if !raft.IsEmptyHardState(ready.HardState) {
+		ps.raftState.HardState = &ready.HardState
+	}
+
+	raftWB.SetMeta(meta.RaftStateKey(ps.region.Id), ps.raftState)
+
+
+	// ApplySnapshot()
+
+	raftWB.WriteToDB(ps.Engines.Raft)
+
 	return nil, nil
 }
 
