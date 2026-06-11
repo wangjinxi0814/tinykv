@@ -6,9 +6,11 @@ import (
 
 	"github.com/Connor1996/badger/y"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/message"
+	"github.com/pingcap-incubator/tinykv/kv/raftstore/meta"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/runner"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/snap"
 	"github.com/pingcap-incubator/tinykv/kv/raftstore/util"
+	"github.com/pingcap-incubator/tinykv/kv/util/engine_util"
 	"github.com/pingcap-incubator/tinykv/log"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/metapb"
 	"github.com/pingcap-incubator/tinykv/proto/pkg/raft_cmdpb"
@@ -50,7 +52,9 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	rd := d.RaftGroup.Ready()
 
 	// 持久化日志条目
-	d.peerStorage.SaveReadyState(&rd)
+	if _, err := d.peerStorage.SaveReadyState(&rd); err != nil {
+		panic(err)
+	}
 
 	// 通过网络向其他的peer 发送raft消息
 	for _, msg := range rd.Messages {
@@ -60,17 +64,87 @@ func (d *peerMsgHandler) HandleRaftReady() {
 	}
 
 	// 应用已提交的日志条目
-	for _, committed_log := range rd.CommittedEntries {
-		// committed_log.Data // 解码当前的日志 获得cmd
-		// 执行对应的操作, 写db -> 执行
-		
-		// 处理Proposals 等待相应的客户端回调
-		for	_, proposal := range d.proposals{
-			if proposal.term == committed_log.Term{
-				if proposal.index == committed_log.Index{
-					// proposal.cb.Done()
+	for _, committedLog := range rd.CommittedEntries {
+		msg := &raft_cmdpb.RaftCmdRequest{}
+		if err := msg.Unmarshal(committedLog.Data); err != nil {
+			log.Errorf("%s failed to unmarshal committed entry: %v", d.Tag, err)
+			continue
+		}
+
+		kvWB := new(engine_util.WriteBatch)
+
+		// 处理普通请求：写操作入 batch
+		for _, req := range msg.Requests {
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Put:
+				kvWB.SetCF(req.Put.Cf, req.Put.Key, req.Put.Value)
+			case raft_cmdpb.CmdType_Delete:
+				kvWB.DeleteCF(req.Delete.Cf, req.Delete.Key)
+			}
+		}
+
+		// 处理 admin 请求
+		if msg.AdminRequest != nil {
+			switch msg.AdminRequest.CmdType {
+			case raft_cmdpb.AdminCmdType_CompactLog:
+				compactLog := msg.AdminRequest.CompactLog
+				if compactLog.CompactIndex >= d.peerStorage.applyState.TruncatedState.Index {
+					d.peerStorage.applyState.TruncatedState.Index = compactLog.CompactIndex
+					d.peerStorage.applyState.TruncatedState.Term = compactLog.CompactTerm
+					d.ScheduleCompactLog(compactLog.CompactIndex)
 				}
-				NotifyStaleReq(proposal.term, proposal.cb);
+			}
+		}
+
+		// 更新 AppliedIndex 并与 KV 写操作一起原子落盘
+		d.peerStorage.applyState.AppliedIndex = committedLog.Index
+		kvWB.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+		kvWB.MustWriteToDB(d.ctx.engine.Kv)
+
+		// 构造 response（读操作在写入落盘后执行，保证一致性）
+		resp := newCmdResp()
+		BindRespTerm(resp, committedLog.Term)
+		for _, req := range msg.Requests {
+			switch req.CmdType {
+			case raft_cmdpb.CmdType_Put:
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Put,
+					Put:     &raft_cmdpb.PutResponse{},
+				})
+			case raft_cmdpb.CmdType_Delete:
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Delete,
+					Delete:  &raft_cmdpb.DeleteResponse{},
+				})
+			case raft_cmdpb.CmdType_Get:
+				val, _ := engine_util.GetCF(d.ctx.engine.Kv, req.Get.Cf, req.Get.Key)
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Get,
+					Get:     &raft_cmdpb.GetResponse{Value: val},
+				})
+			case raft_cmdpb.CmdType_Snap:
+				resp.Responses = append(resp.Responses, &raft_cmdpb.Response{
+					CmdType: raft_cmdpb.CmdType_Snap,
+					Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+				})
+			}
+		}
+
+		// 处理 Proposals：按 index 匹配，term 不符则通知过期
+		for i, proposal := range d.proposals {
+			if proposal.index == committedLog.Index {
+				if proposal.term == committedLog.Term {
+					if proposal.cb != nil {
+						if len(msg.Requests) > 0 && msg.Requests[0].CmdType == raft_cmdpb.CmdType_Snap {
+							proposal.cb.Txn = d.ctx.engine.Kv.NewTransaction(false)
+						}
+						proposal.cb.Done(resp)
+					}
+				} else {
+					NotifyStaleReq(committedLog.Term, proposal.cb)
+				}
+				d.proposals = append(d.proposals[:i], d.proposals[i+1:]...)
+				break
 			}
 		}
 	}
@@ -147,7 +221,21 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
 		cb.Done(ErrResp(err))
 		return
 	}
-	// Your Code Here (2B).
+
+	data, err := msg.Marshal()
+	if err != nil {
+		cb.Done(ErrResp(err))
+		return
+	}
+
+	// 存入cb 用index 和 term 标志
+	d.proposals = append(d.proposals, &proposal{
+		index: d.nextProposalIndex(), // lastIndex + 1
+		term:  d.Term(),
+		cb:    cb,
+	})
+
+	d.RaftGroup.Propose(data)
 }
 
 func (d *peerMsgHandler) onTick() {

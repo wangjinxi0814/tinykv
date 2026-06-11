@@ -45,8 +45,10 @@ func (rd *Ready) AppliedCursor() uint64 {
 	if n := len(rd.CommittedEntries); n > 0 {
 		return rd.CommittedEntries[n-1].Index // 最后一条的 index
 	}
-	if snapIndex := rd.Snapshot.Metadata.Index; snapIndex > 0 {
-		return snapIndex
+	if rd.Snapshot.Metadata != nil {
+		if snapIndex := rd.Snapshot.Metadata.Index; snapIndex > 0 {
+			return snapIndex
+		}
 	}
 	return 0
 }
